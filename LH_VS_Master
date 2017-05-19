@@ -20,16 +20,39 @@ def initialize(context):
     set_backtest()                           # 设置回测条件
     set_benchmark('000300.XSHG')             # 设置回测基准
     #set_benchmark('399006.XSHE')
+    set_trade_freq()                         # 设置交易频率，按天、周、月
+
 
 
 #设置中间变量，仅定义需要在回测间保存的变量
 def set_variables():
-    g.df_peg_rank_yest = pd.DataFrame()      #
+    g.intra_industry_count = 2               # 定义组合中同一个行业的股票个数
+    g.stock_to_hold_last = []                # 初始化变量
+    g.stock_to_buy_limit = 10                # 定义买入股票的排名阈值
+    g.stock_to_sell_limit = 15               # 定义卖出股票的排名阈值
 
 #设置回测条件
 def set_backtest():
     set_option('use_real_price',True)        # 用真实价格交易
     log.set_level('order','error')           # 设置报错等级
+
+
+def set_trade_freq():
+    # 指定每月第一个交易日, 在开盘第一分钟执行
+    #run_monthly(monthly, 1, 'open')
+
+    # 指定每周倒数第一个交易日, 在开盘前执行, 此函数中不能下单
+    #run_weekly(weekly, -1, 'before_open')
+    run_weekly(lh_main,-1,'open')
+
+    # 指定每天收盘后执行, 此函数中不能下单
+    #run_daily(daily, 'after_close')
+
+    # 指定在每天的10:00运行, 必须选择分钟回测, 否则不会执行
+    #run_daily(daily, '10:00')
+
+    # 指定在每天的14:00运行, 必须选择分钟回测, 否则不会执行
+    #run_daily(daily, '14:00')
 
 '''
 ================================================================================
@@ -39,21 +62,8 @@ def set_backtest():
 #每天开盘前要做的事情
 def before_trading_start(context):
 
-    # 设定回测参数
-    g.intra_industry_count = 2               # 定义组合中同一个行业的股票个数
-
-
     # 设置手续费
     set_slip_fee(context)
-
-    # 设置股票池,股票池会随着新股上市而变化
-    g.stocks = get_index_stocks('000300.XSHG') # 设置沪深300为初始股票池
-    g.stocks_1 = get_index_stocks('399006.XSHE')
-    g.stocks.extend(g.stocks_1)
-
-    # 设置可行股票池，去除当日停牌的股票
-    g.feasible_stocks = set_feasible_stocks(g.stocks,context)
-
 
 # 根据不同的时间段设置滑点与手续费
 def set_slip_fee(context):
@@ -71,228 +81,231 @@ def set_slip_fee(context):
         set_commission(PerTrade(buy_cost=0.003, sell_cost=0.004, min_cost=5))
 
 
-# 设置可行股票池：过滤掉当日停牌的股票
-def set_feasible_stocks(initial_stocks,context):
-    # 判断初始股票池的股票是否停牌，返回list
-    paused_info = []
-    current_data = get_current_data()
-    for i in initial_stocks:
-        paused_info.append(current_data[i].paused)
-    df_paused_info = pd.DataFrame({'paused_info':paused_info},index = initial_stocks)
-    unsuspened_stocks =list(df_paused_info.index[df_paused_info.paused_info == False])
-    return unsuspened_stocks
-
 '''
 ================================================================================
-每天交易时
+交易时
 ================================================================================
 '''
-# 每个单位时间(如果按天回测,则每天调用一次,如果按分钟,则每分钟调用一次)调用一次
-def handle_data(context, data):
+def lh_main(context):
 
-    # 取得备选股票列表
-    df_sort_PEG = prepare_stock_list(context)
+    # 引用 lib
+    g.prepare = lh_prepare_lib()
+    g.algorithm = lh_algo_lib()
+    g.trade = lh_trade_lib()
+    g.operation = lh_operation_lib()
 
-    # 股票买入判断
-    list_to_buy, list_to_sell_tmp = stocks_to_buy(context, df_sort_PEG)
 
-    # 当前仓位卖出判断
-    list_to_sell = stocks_to_sell(context, list_to_sell_tmp)
+    # 取得股票池列表
+    g.stock_pool_list = g.prepare.get_stock_pool_list(context)
 
-    # 股票卖出及买入操作
-    # 卖出操作
-    sell_operation(list_to_sell)
-    # LH: 买入操作
-    message_buy = buy_operation(context, list_to_buy)
+    # 计算待持有的股票列表
+    g.stock_to_hold_list = g.algorithm.get_hold_stock_list(context,g.stock_pool_list)
 
-    # 发送消息：
-    message_all = ['Sell Security']
-    message_all.extend(list_to_sell)
-    message_all.append('Buy Security')
-    message_all.extend(message_buy)
-    send_message(message_all)
-    log.info(message_all)
+    # 计算持有股票的仓位
+    g.stock_to_trade_df = g.trade.get_stock_to_trade_df(context,g.stock_to_hold_list)
+
+    # 执行卖出和买入操作
+    g.operation.trade_execution(context,g.stock_to_trade_df)
+
 
 
 ################################################################################
 ################################################################################
-# 取得备选股票列表
-def prepare_stock_list(context):
+class lh_prepare_lib():
 
-    # 限制条件1：PEG值
-    # 得到一个dataframe：index为股票代码，data为相应的PEG值
-    df_PEG = get_PEG(context, g.feasible_stocks)
+    def __init__(self, _period = '1d'):
+        pass
 
-    # 将股票按PEG升序排列，返回daraframe类型
-    df_sort_PEG = df_PEG.sort(columns=['peg'], ascending=[1])
+    def set_stock_pool_scope(self,context):
+        # 设置股票池,股票池会随着新股上市而变化
+        index1 = get_index_stocks('000001.XSHG') # 上证指数
+        index2 = get_index_stocks('399001.XSHE') # 深证成指
+        initial_stocks = index1+index2
+        return initial_stocks
 
-    # 筛选出符合条件的股票
-    df_sort_PEG = df_sort_PEG[(df_sort_PEG.inc_rev_yoy>0)&(df_sort_PEG.inc_rev_yoy<150)&\
-                              (df_sort_PEG.inc_npft_yoy>0)&(df_sort_PEG.inc_npft_yoy<150)&\
-                              (df_sort_PEG.pe>0)&\
-                              (df_sort_PEG.mkt_cap<1000)]
+    def delete_pause_stock(self,context,initial_stocks):
+        # 判断初始股票池的股票是否停牌，返回list
+        paused_info = []
+        current_data = get_current_data()
+        for i in initial_stocks:
+            paused_info.append(current_data[i].paused)
+        df_paused_info = pd.DataFrame({'paused_info':paused_info},index = initial_stocks)
+        unsuspened_stocks =list(df_paused_info.index[df_paused_info.paused_info == False])
+        return unsuspened_stocks
 
-
-    # 限制条件2：行业分散
-    # LH: 增加了行业限制
-    df_sort_PEG = industry_limit(df_sort_PEG)
-
-    return df_sort_PEG
-
-
-# 计算股票的PEG值
-def get_PEG(context, stock_list):
-    # 查询股票池里股票的市盈率，收益增长率
-    q_PE_G = query(valuation.code, \
-                   valuation.pe_ratio, \
-                   indicator.inc_revenue_year_on_year, \
-                   indicator.inc_net_profit_year_on_year,\
-                   valuation.market_cap, \
-                     ).filter(valuation.code.in_(stock_list))
-    # 得到一个dataframe：包含股票代码、市盈率PE、收益增长率G
-    # 默认date = context.current_dt的前一天,使用默认值，避免未来函数，不建议修改
-    #df_data = get_fundamentals(q_PE_G, date=current_date)
-    df_data = get_fundamentals(q_PE_G)
-    df_data = df_data.dropna()
-
-    # 重新给columns命名
-    df_data.columns = ['code','pe','inc_rev_yoy','inc_npft_yoy','mkt_cap']
-
-    # 得到一个Series：存放股票的市盈率TTM，即PE值
-    stock_PE = df_data['pe'].values
-    # 得到一个Series：存放股票的收益增长率，即G值
-    stock_G = df_data['inc_npft_yoy'].values
-    # 得到一个Series：存放股票的PEG值
-    stock_PEG = stock_PE/stock_G
-
-    df_data.insert(5,'peg',stock_PEG)
-
-    df_data.index = df_data['code'].values
-    df_data = df_data.drop('code',axis=1)
-
-
-
-    return df_data
-
-
-# 限定每个细分行业只能有3支股票
-def industry_limit(df_sort_PEG):
-    # 定义每个行业股票允许出现的次数
-    count_limit = g.intra_industry_count
-    industry_list = []
-
-    # 读取数据文件
-    body = read_file('data/stock_industry_info.csv')
-    # 读取数据的第一列为index
-    pd_data = pd.read_csv(StringIO(body), index_col=0)
-
-    # 复制index
-    peg_index = df_sort_PEG.index
-    # 开始循环处理
-    for stock_code in peg_index:
-        # 防止行业信息不全
-        if stock_code in pd_data.index:
-            # 获得该股票的行业代码
-            industry_code = pd_data['industry_code'][stock_code]
-            # 进行判断
-            if industry_list.count(industry_code) <= count_limit:
-                # 将该行业code加入到列表
-                industry_list.append(industry_code)
-            if industry_list.count(industry_code) > count_limit:
-                # 删除该行
-                df_sort_PEG = df_sort_PEG.drop(stock_code)
-
-    df_sort_PEG.insert(5,'rank',np.arange(0,df_sort_PEG.shape[0]))
-
-    return df_sort_PEG
+    # submain
+    def get_stock_pool_list(self,context):
+        #
+        initial_stocks = self.set_stock_pool_scope(context)
+        stock_pool_list = self.delete_pause_stock(context,initial_stocks)
+        return stock_pool_list
 
 ################################################################################
-################################################################################
-# 多仓（买入）信号汇总信号判断
-def stocks_to_buy(context, df_sort_PEG):
-    # 变量初始化
-    list_to_buy = []
-    list_to_sell_tmp = []
+class lh_algo_lib():
 
-    # 将存储有序股票代码index转换成list并取前g.num_stocks个为待买入的股票，返回list
-    # 将跌入排名前十的股票，加入到购买清单
-    for i in range(0, 10):
-        # 禁止一次性买入
-        if g.df_peg_rank_yest.shape[0]>0:
-            # 如果该股票代码，也存在于上一个交易日的清单中
-            if df_sort_PEG.index[i] in g.df_peg_rank_yest.index:
-                # 如果上一个交易日该股票的排名在10名以外
-                if g.df_peg_rank_yest['rank'][df_sort_PEG.index[i]]>9:
-                    list_to_buy.append(df_sort_PEG.index[i])
-            else:
-                list_to_buy.append(df_sort_PEG.index[i])
+    def __init__(self, _period = '1d'):
+        pass
 
+    def get_PEG_df(self,context,stock_pool_list):
+        # 查询股票池里股票的市盈率，收益增长率
+        q_PE_G = query(valuation.code, \
+                       valuation.pe_ratio, \
+                       indicator.inc_revenue_year_on_year, \
+                       indicator.inc_net_profit_year_on_year,\
+                       valuation.market_cap, \
+                         ).filter(valuation.code.in_(stock_pool_list))
+        # 默认date = context.current_dt的前一天,使用默认值，避免未来函数，不建议修改
+        df_data = get_fundamentals(q_PE_G)
+        df_data = df_data.dropna()
+        # 重新给columns命名
+        df_data.columns = ['code','pe','inc_rev_yoy','inc_npft_yoy','mkt_cap']
+        # 得到一个Series：存放股票的市盈率TTM，即PE值
+        stock_PE = df_data['pe'].values
+        # 得到一个Series：存放股票的收益增长率，即G值
+        stock_G = df_data['inc_npft_yoy'].values
+        # 得到一个Series：存放股票的PEG值
+        stock_PEG = stock_PE/stock_G
+        # 将PEG插入到df
+        df_data.insert(5,'peg',stock_PEG)
+        # 将df的index更新为股票代码，并删掉原股票代码列
+        df_data.index = df_data['code'].values
+        df_data = df_data.drop('code',axis=1)
+        return df_data
 
-    for i in range(0, 15):
+    def filter_PEG_df(self,context,df_PEG):
+        # 将股票按PEG升序排列，返回daraframe类型
+        df_sort_PEG = df_PEG.sort(columns=['peg'], ascending=[1])
+        # 筛选出符合条件的股票
+        df_sort_PEG = df_sort_PEG[(df_sort_PEG.inc_rev_yoy>0)&(df_sort_PEG.inc_rev_yoy<150)&\
+                                  (df_sort_PEG.inc_npft_yoy>0)&(df_sort_PEG.inc_npft_yoy<150)&\
+                                  (df_sort_PEG.pe>0)&\
+                                  (df_sort_PEG.mkt_cap<1000)]
+        return df_sort_PEG
+
+    def diversify_by_industry(self,context,df_sort_PEG):
         # 初始化
-        if g.df_peg_rank_yest.shape[0]>0:
-            # 上一个交易日的股票代码，在当日的清单中
-            if g.df_peg_rank_yest.index[i] in df_sort_PEG.index:
-                # 如果当日的股票排名在15名以外
-                if df_sort_PEG['rank'][g.df_peg_rank_yest.index[i]]>14:
-                    list_to_sell_tmp.append(g.df_peg_rank_yest.index[i])
-                #elif df_sort_PEG['rank'][g.df_peg_rank_yest.index[i]]<9:
-                #    list_to_sell_tmp.append(g.df_peg_rank_yest.index[i])
-            else:
-                list_to_sell_tmp.append(g.df_peg_rank_yest.index[i])
+        industry_list = []
+        # 读取数据文件
+        body = read_file('data/stock_industry_info.csv')
+        # 读取数据的第一列为index
+        pd_data = pd.read_csv(StringIO(body), index_col=0)
+        # 复制index
+        peg_index = df_sort_PEG.index
+        # 开始循环处理
+        for stock_code in peg_index:
+            # 防止行业信息不全
+            if stock_code in pd_data.index:
+                # 获得该股票的行业代码
+                industry_code = pd_data['industry_code'][stock_code]
+                # 进行判断
+                if industry_list.count(industry_code) <= g.intra_industry_count:
+                    # 将该行业code加入到列表
+                    industry_list.append(industry_code)
+                if industry_list.count(industry_code) > g.intra_industry_count:
+                    # 删除该行
+                    df_sort_PEG = df_sort_PEG.drop(stock_code)
+        #df_sort_PEG.insert(5,'rank',np.arange(0,df_sort_PEG.shape[0]))
+        return df_sort_PEG
 
-    g.df_peg_rank_yest = df_sort_PEG[:30]
+    def extend_hold_period(self,context,df_PEG_filter):
+        # 初始化
+        stock_to_hold_list = []
+        hold_list_prep = df_PEG_filter.index.values
+        hold_list_last = g.stock_to_hold_last
+        # 注意：策略在初始化时，会一次性买入股票
+        # 将满足购买条件的股票加入到清单
+        for i in range(0,g.stock_to_buy_limit):
+            stock_to_hold_list.append(hold_list_prep[i])
+        # 将未跌出卖出条件的股票加入到购买清单
+        for i in range(g.stock_to_buy_limit,g.stock_to_sell_limit):
+            if hold_list_prep[i] in hold_list_last:
+                stock_to_hold_list.append(hold_list_prep[i])
+        # 保存变量
+        g.stock_to_hold_last = stock_to_hold_list
+        return stock_to_hold_list
 
-    return list_to_buy, list_to_sell_tmp
+    # submain
+    def get_hold_stock_list(self,context,stock_pool_list):
+        # 取得PEG df：index为股票代码，data为相应的PEG值
+        df_PEG = self.get_PEG_df(context, stock_pool_list)
+        # 对PEG df进行筛选
+        df_PEG_filter = self.filter_PEG_df(context,df_PEG)
+        # 限制股票列表中每个行业所占股票的数量
+        df_PEG_filter = self.diversify_by_industry(context,df_PEG_filter)
+        # 取得待持有的股票列表
+        stock_to_hold_list = self.extend_hold_period(context,df_PEG_filter)
+        return stock_to_hold_list
 
 ################################################################################
+class lh_trade_lib():
+
+    def __init__(self, _period = '1d'):
+        pass
+
+    def get_stock_pause_info(self,context,stock_code):
+        # 取得所有数据信息
+        current_data = get_current_data()
+        stock_pause_status = current_data[stock_code].paused
+
+        return stock_pause_status
+
+    def get_stock_zhangting_info(self,context,stock_code):
+        # 取得所有数据信息
+        current_data = get_current_data()
+        # 判断涨停信息
+        today_open = current_data[stock_code].day_open
+        yest_close = history(count=1, unit='1d', field='close', security_list=stock_code).values
+        zhangting_status = (today_open/yest_close > 1.09)
+        return zhangting_status
+
+    def get_stock_trade_info(self,context,stock_to_hold_list):
+        # 初始化
+        stock_to_trade_df = pd.DataFrame(columns=['stock_code','buyorsell','target_value'])
+        # 取得当前的持仓信息
+        curr_hold_stock_list = context.portfolio.positions.keys()
+        # 计算为每只股票分配的资金
+        capital_unit=context.portfolio.portfolio_value/15
+        # 计算待卖出的交易信号
+        for stock_code in curr_hold_stock_list:
+            if stock_code not in stock_to_hold_list:
+                # 判断是否停牌
+                if self.get_stock_pause_info(context,stock_code)==False:
+                    # 判断该股是否涨停
+                    if self.get_stock_zhangting_info(context,stock_code)==False:
+                        stock_to_trade_df_tmp = pd.DataFrame([[stock_code,'sell',0.0]],columns=['stock_code','buyorsell','target_value'])
+                        stock_to_trade_df = pd.concat([stock_to_trade_df,stock_to_trade_df_tmp])
+        # 计算待买入的交易信号
+        for stock_code in stock_to_hold_list:
+            if stock_code not in curr_hold_stock_list:
+                stock_to_trade_df_tmp = pd.DataFrame([[stock_code,'buy',capital_unit]],columns=['stock_code','buyorsell','target_value'])
+                stock_to_trade_df = pd.concat([stock_to_trade_df,stock_to_trade_df_tmp])
+        stock_to_trade_df.index = np.arange(0,stock_to_trade_df.shape[0],1)
+        return stock_to_trade_df
+
+    # Submain
+    def get_stock_to_trade_df(self,context,stock_to_hold_list):
+        # 计算调仓信息
+        stock_to_trade_df = self.get_stock_trade_info(context,stock_to_hold_list)
+
+        return stock_to_trade_df
+
 ################################################################################
-# 空仓（卖出）信号判断
-def stocks_to_sell(context, list_to_sell_tmp):
-    list_to_sell=[]
-    current_data = get_current_data()
-    # 对于不需要持仓的股票，全仓卖出
-    for stock_sell in list_to_sell_tmp:
-        # 条件1：该股票是否停牌
-        paused_status = current_data[stock_sell].paused
-        if paused_status == False:
-            # 条件2：该股票是否涨停
-            today_open = current_data[stock_sell].day_open
-            yest_close = history(count=1, unit='1d', field='close', security_list=stock_sell).values
-            full_growth_status = (today_open/yest_close > 1.09)
-            if full_growth_status == False:
-                #
-                list_to_sell.append(stock_sell)
+class lh_operation_lib():
 
-    return list_to_sell
+    def __init__(self, _period = '1d'):
+        pass
 
-################################################################################
-################################################################################
-# 卖出及买入操作
-def sell_operation(list_to_sell):
-    for stock_sell in list_to_sell:
-        order_target_value(stock_sell, 0)
+    def stock_trade_operation(self,context,trade_flag,stock_to_trade_df):
+        for i in stock_to_trade_df.index:
+            if stock_to_trade_df['buyorsell'][i]==trade_flag:
+                order_target_value(stock_to_trade_df['stock_code'][i], stock_to_trade_df['target_value'][i])
 
-# 执行买入操作
-def buy_operation(context, list_to_buy):
-    #for stock_sell in list_to_buy:
+    # Submain
+    def trade_execution(self,context,stock_to_trade_df):
+        # 执行交易
+        self.stock_trade_operation(context,'sell',stock_to_trade_df)
+        self.stock_trade_operation(context,'buy',stock_to_trade_df)
 
-    # 为每个持仓股票分配资金
-    #g.capital_unit=context.portfolio.portfolio_value/len(list_to_buy)
-    g.capital_unit=context.portfolio.portfolio_value/15
-
-    # LH：当前的持股信息
-    current_security = context.portfolio.positions.keys()
-    # 消息列表
-    message_buy = []
-
-    # 买入在“待买股票列表”的股票
-    for stock_buy in list_to_buy:
-        if stock_buy not in current_security:
-            order_target_value(stock_buy, g.capital_unit)
-            message_buy.append(stock_buy)
-
-    return message_buy
 
 '''
 ================================================================================
