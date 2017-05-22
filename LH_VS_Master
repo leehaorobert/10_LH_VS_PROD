@@ -7,6 +7,7 @@
 '''
 import pandas as pd
 import numpy as np
+import datetime as dt
 from six import StringIO
 
 '''
@@ -26,10 +27,17 @@ def initialize(context):
 
 #设置中间变量，仅定义需要在回测间保存的变量
 def set_variables():
+    # 计算待持有的股票列表
     g.intra_industry_count = 2               # 定义组合中同一个行业的股票个数
     g.stock_to_hold_last = []                # 初始化变量
     g.stock_to_buy_limit = 10                # 定义买入股票的排名阈值
-    g.stock_to_sell_limit = 15               # 定义卖出股票的排名阈值
+    #g.stock_to_sell_limit = 15               # 定义卖出股票的排名阈值
+    # 计算持仓比例
+    g.risk_lag = 180                         # 定义计算风险的分析期间
+    g.confidence_level = 2.58                # 定义置信率，即：正态分布下的发生概率，1.96, 95%; 2.06, 96%; 2.18, 97%; 2.34, 98%; 2.58, 99%; 5, 99.9999%
+    g.portfolio_risk_lag = 180
+    g.portfolio_confidence_level = 1.96      # 1.96, 95%
+    g.portfolio_risk_rate = 0.03             # 定义能够成熟的最大损失
 
 #设置回测条件
 def set_backtest():
@@ -47,6 +55,7 @@ def set_trade_freq():
 
     # 指定每天收盘后执行, 此函数中不能下单
     #run_daily(daily, 'after_close')
+    #run_daily(lh_main,'open')
 
     # 指定在每天的10:00运行, 必须选择分钟回测, 否则不会执行
     #run_daily(daily, '10:00')
@@ -117,10 +126,7 @@ class lh_prepare_lib():
         pass
 
     def set_stock_pool_scope(self,context):
-        # 设置股票池,股票池会随着新股上市而变化
-        index1 = get_index_stocks('000001.XSHG') # 上证指数
-        index2 = get_index_stocks('399001.XSHE') # 深证成指
-        initial_stocks = index1+index2
+        initial_stocks = list(get_all_securities(['stock'], context.current_dt.date()).index)
         return initial_stocks
 
     def delete_pause_stock(self,context,initial_stocks):
@@ -133,11 +139,22 @@ class lh_prepare_lib():
         unsuspened_stocks =list(df_paused_info.index[df_paused_info.paused_info == False])
         return unsuspened_stocks
 
+    def delete_new_stock(self,context,stock_list,deltaday):
+        deltaDate = context.current_dt.date() - dt.timedelta(deltaday)
+        stock_list_new = []
+        for stock in stock_list:
+            if get_security_info(stock).start_date < deltaDate:
+                stock_list_new.append(stock)
+        return stock_list_new
+
     # submain
     def get_stock_pool_list(self,context):
-        #
+        # 初始化
         initial_stocks = self.set_stock_pool_scope(context)
+        # 去除停牌的股票
         stock_pool_list = self.delete_pause_stock(context,initial_stocks)
+        # 去除刚上市的股票，因为新股无法根据历史走势计算风险系数
+        stock_pool_list = self.delete_new_stock(context,stock_pool_list,300)
         return stock_pool_list
 
 ################################################################################
@@ -224,6 +241,10 @@ class lh_algo_lib():
         g.stock_to_hold_last = stock_to_hold_list
         return stock_to_hold_list
 
+    def get_stock_list_by_count(self,context,df_PEG_filter):
+        stock_to_hold_list = df_PEG_filter.index.values[:g.stock_to_buy_limit]
+        return stock_to_hold_list
+
     # submain
     def get_hold_stock_list(self,context,stock_pool_list):
         # 取得PEG df：index为股票代码，data为相应的PEG值
@@ -233,7 +254,9 @@ class lh_algo_lib():
         # 限制股票列表中每个行业所占股票的数量
         df_PEG_filter = self.diversify_by_industry(context,df_PEG_filter)
         # 取得待持有的股票列表
-        stock_to_hold_list = self.extend_hold_period(context,df_PEG_filter)
+        #stock_to_hold_list = self.extend_hold_period(context,df_PEG_filter)
+        stock_to_hold_list = self.get_stock_list_by_count(context,df_PEG_filter)
+
         return stock_to_hold_list
 
 ################################################################################
@@ -258,34 +281,237 @@ class lh_trade_lib():
         zhangting_status = (today_open/yest_close > 1.09)
         return zhangting_status
 
-    def get_stock_trade_info(self,context,stock_to_hold_list):
+    # ES风险计算逻辑
+    def cal_stock_risk_ES(self,context,stock_code,risk_lag,confidence_level):
+        # 取得历史收盘数据
+        hStocks = history(risk_lag, '1d', 'close', stock_code)
+        # 计算日收益率／日变动率
+        #dailyReturns = hStocks.resample('D',how='last').pct_change().fillna(value=0, method=None, axis=0).values
+        dailyReturns = hStocks.pct_change().fillna(value=0, method=None, axis=0).values
+        # 按照升序排序
+        dailyReturns_sort =  sorted(dailyReturns)
+
+        # 根据置信水平，计算Alpha。表示基于正态分布函数下的事件发生概率
+        if confidence_level   == 1.96:
+            alpha = (1 - 0.95)
+        elif confidence_level == 2.06:
+            alpha = (1 - 0.96)
+        elif confidence_level == 2.18:
+            alpha = (1 - 0.97)
+        elif confidence_level == 2.34:
+            alpha = (1 - 0.98)
+        elif confidence_level == 2.58:
+            alpha = (1 - 0.99)
+        elif confidence_level == 5:
+            alpha = (1 - 0.99999)
+        else:
+            alpha = (1 - 0.95)
+        # 根据risk_lag(采样期间)和alpha，计算ES的期间
+        ES_sample = risk_lag * alpha
         # 初始化
-        stock_to_trade_df = pd.DataFrame(columns=['stock_code','buyorsell','target_value'])
+        count = 0
+        sum_value = 0
+        # 计算ES的和
+        for i in range(len(dailyReturns_sort)):
+            if i < ES_sample:
+                sum_value = sum_value+dailyReturns_sort[i][0]
+                count = count+1
+        # 计算ES
+        if count == 0:
+            ES = 0
+        else:
+            ES = -(sum_value / ES_sample)
+        if isnan(ES):
+            ES = 0
+        return ES
+
+    # 新的配仓分配逻辑
+    def cal_stock_alloc_ratio(self,context,stock_to_hold_list):
+        # 初始化
+        stock_alloc_ratio_df = pd.DataFrame(index=stock_to_hold_list,columns=['risk_ES','position','position_ratio'])
+        # 计算风险系数ES的值
+        for stock_code_tmp in stock_to_hold_list:
+            stock_alloc_ratio_df['risk_ES'][stock_code_tmp] = self.cal_stock_risk_ES(context,stock_code_tmp,g.risk_lag,g.confidence_level)
+            stock_alloc_ratio_df['position'][stock_code_tmp] = 1.0 / stock_alloc_ratio_df['risk_ES'][stock_code_tmp]
+        # 根据ES值计算持仓比例
+        total_position = sum(stock_alloc_ratio_df['position'].values)
+        for stock_code_tmp in stock_to_hold_list:
+            ratio_tmp = stock_alloc_ratio_df['position'][stock_code_tmp]/total_position
+            if isnan(ratio_tmp):
+                ratio_tmp = 0
+            stock_alloc_ratio_df['position_ratio'][stock_code_tmp] = round(ratio_tmp, 4)
+
+        return stock_alloc_ratio_df
+
+    # 根据各支股票的持仓比例，计算调仓信息
+    def get_stock_trade_info(self,context,stock_alloc_ratio_df,portfolio_alloc_ratio):
+        # 初始化
+        stock_to_trade_df = pd.DataFrame(columns=['stock_code','buyorsell','original_value','target_value'])
         # 取得当前的持仓信息
         curr_hold_stock_list = context.portfolio.positions.keys()
-        # 计算为每只股票分配的资金
-        capital_unit=context.portfolio.portfolio_value/15
-        # 计算待卖出的交易信号
+        # 取得可分配的总金额
+        total_capital = context.portfolio.portfolio_value * portfolio_alloc_ratio
+        # 取得待卖出的股票中，已停牌和已涨停的股票信息
+        unavailable_capital = 0
+        # 如果该股票在当前持仓中，但不在未来持仓清单中
         for stock_code in curr_hold_stock_list:
-            if stock_code not in stock_to_hold_list:
-                # 判断是否停牌
-                if self.get_stock_pause_info(context,stock_code)==False:
-                    # 判断该股是否涨停
-                    if self.get_stock_zhangting_info(context,stock_code)==False:
-                        stock_to_trade_df_tmp = pd.DataFrame([[stock_code,'sell',0.0]],columns=['stock_code','buyorsell','target_value'])
-                        stock_to_trade_df = pd.concat([stock_to_trade_df,stock_to_trade_df_tmp])
-        # 计算待买入的交易信号
-        for stock_code in stock_to_hold_list:
-            if stock_code not in curr_hold_stock_list:
-                stock_to_trade_df_tmp = pd.DataFrame([[stock_code,'buy',capital_unit]],columns=['stock_code','buyorsell','target_value'])
+            if stock_code not in stock_alloc_ratio_df.index:
+                if self.get_stock_pause_info(context,stock_code)==True:
+                    unavailable_capital = unavailable_capital+context.portfolio.positions[stock_code].value
+                elif self.get_stock_zhangting_info(context,stock_code)==True:
+                    unavailable_capital = unavailable_capital+context.portfolio.positions[stock_code].value
+                else:
+                    current_value_tmp = context.portfolio.positions[stock_code].value
+                    stock_to_trade_df_tmp = pd.DataFrame([[stock_code,'sell',current_value_tmp,0.0]],columns=['stock_code','buyorsell','original_value','target_value'])
+                    stock_to_trade_df = pd.concat([stock_to_trade_df,stock_to_trade_df_tmp])
+        # 计算可分配的金额
+        available_capital = total_capital-unavailable_capital
+        # Loop
+        for stock_code in stock_alloc_ratio_df.index:
+            current_value_tmp = context.portfolio.positions[stock_code].value
+            target_value_tmp = stock_alloc_ratio_df['position_ratio'][stock_code] * available_capital
+            if current_value_tmp > target_value_tmp:
+                stock_to_trade_df_tmp = pd.DataFrame([[stock_code,'sell',current_value_tmp,target_value_tmp]],columns=['stock_code','buyorsell','original_value','target_value'])
                 stock_to_trade_df = pd.concat([stock_to_trade_df,stock_to_trade_df_tmp])
+            else:
+                stock_to_trade_df_tmp = pd.DataFrame([[stock_code,'buy',current_value_tmp,target_value_tmp]],columns=['stock_code','buyorsell','original_value','target_value'])
+                stock_to_trade_df = pd.concat([stock_to_trade_df,stock_to_trade_df_tmp])
+        #
         stock_to_trade_df.index = np.arange(0,stock_to_trade_df.shape[0],1)
+
         return stock_to_trade_df
+
+
+    # 计算股票的DailyReturn
+    def get_stock_daily_return(self,stock_code,freq,lag):
+        hStocks = history(lag, freq, 'close', stock_code)
+        #dailyReturns = hStocks.resample('D',how='last').pct_change().fillna(value=0, method=None, axis=0).values
+        dailyReturns = hStocks.pct_change().fillna(value=0, method=None, axis=0).values
+        return dailyReturns
+
+    # 计算股票组合的DailyReturn
+    def get_portfolio_daily_return(self,context,stock_alloc_ratio_df,freq,portfolio_risk_lag):
+        # 初始化
+        portfolio_dailyReturns = []
+        for stock_code in stock_alloc_ratio_df.index:
+            if stock_alloc_ratio_df['position_ratio'][stock_code]<>0:
+                stock_dailyReturns = self.get_stock_daily_return(stock_code,freq,portfolio_risk_lag)
+                tmp_list = []
+                for i in range(len(stock_dailyReturns)):
+                    tmp_list.append(stock_dailyReturns[i]*stock_alloc_ratio_df['position_ratio'][stock_code])
+                # 组合的累加
+                if portfolio_dailyReturns:
+                    tmp_list_2 = []
+                    for i in range(len(portfolio_dailyReturns)):
+                        tmp_list_2.append(portfolio_dailyReturns[i]+tmp_list[i])
+                    portfolio_dailyReturns = tmp_list_2
+                else:
+                    portfolio_dailyReturns = tmp_list
+        return portfolio_dailyReturns
+
+    # 计算股票组合的ES风险系数
+    def cal_portfolio_risk_ES(self,context,stock_alloc_ratio_df,portfolio_risk_lag,portfolio_confidence_level):
+        # 计算投资组合的Daily return
+        portfolio_dailyReturns = self.get_portfolio_daily_return(context,stock_alloc_ratio_df,'1d',portfolio_risk_lag)
+        portfolio_dailyReturns_sort = sorted(portfolio_dailyReturns)
+
+        # 根据置信水平，计算Alpha。表示基于正态分布函数下的事件发生概率
+        if portfolio_confidence_level   == 1.96:
+            alpha = (1 - 0.95)
+        elif portfolio_confidence_level == 2.06:
+            alpha = (1 - 0.96)
+        elif portfolio_confidence_level == 2.18:
+            alpha = (1 - 0.97)
+        elif portfolio_confidence_level == 2.34:
+            alpha = (1 - 0.98)
+        elif portfolio_confidence_level == 2.58:
+            alpha = (1 - 0.99)
+        elif portfolio_confidence_level == 5:
+            alpha = (1 - 0.99999)
+        else:
+            alpha = (1 - 0.95)
+        # 根据risk_lag(采样期间)和alpha，计算ES的期间
+        ES_sample = portfolio_risk_lag * alpha
+        # 初始化
+        count = 0
+        sum_value = 0
+        # 计算ES的和
+        for i in range(len(portfolio_dailyReturns_sort)):
+            if i < ES_sample:
+                sum_value = sum_value+portfolio_dailyReturns_sort[i][0]
+                count = count+1
+        # 计算ES
+        if count == 0:
+            ES = 0
+        else:
+            ES = -(sum_value / ES_sample)
+        if isnan(ES):
+            ES = 0
+
+        return ES
+
+    # 计算股票组合的VaR风险系数
+    def cal_portfolio_risk_VaR(self,context,stock_alloc_ratio_df,portfolio_risk_lag,portfolio_confidence_level):
+        # 计算投资组合的Daily return
+        portfolio_dailyReturns = self.get_portfolio_daily_return(context,stock_alloc_ratio_df,'1d',portfolio_risk_lag)
+        VaR_ratio = 1.0 * portfolio_confidence_level * np.std(portfolio_dailyReturns)
+        return VaR_ratio
+
+    # 根据股票组合的整体风险，计算整理仓位比例
+    def cal_portfolio_alloc_ratio(self,context,stock_alloc_ratio_df):
+        # 计算股票组合的ES风险
+        portfolio_ES_ratio = self.cal_portfolio_risk_ES(context,stock_alloc_ratio_df,g.portfolio_risk_lag,g.portfolio_confidence_level)
+        # 计算股票组合的VaR风险
+        portfolio_VaR_ratio = self.cal_portfolio_risk_VaR(context,stock_alloc_ratio_df,g.portfolio_risk_lag,g.portfolio_confidence_level)
+
+        # 计算风险金
+        risk_money = context.portfolio.portfolio_value * g.portfolio_risk_rate
+        maxrisk_money = 1.2 * risk_money
+        # 计算可承受风险下，投资组合的金额
+        portfolio_risk_value_ES = 0
+        if portfolio_ES_ratio:
+            portfolio_risk_value_ES = maxrisk_money / portfolio_ES_ratio
+
+        portfolio_risk_value_VaR = 0
+        if portfolio_VaR_ratio:
+            portfolio_risk_value_VaR = risk_money / portfolio_VaR_ratio
+
+        portfolio_risk_value = 0
+        if portfolio_risk_value_ES == 0:
+            portfolio_risk_value = portfolio_risk_value_VaR
+        elif portfolio_risk_value_VaR == 0:
+            portfolio_risk_value = portfolio_risk_value_ES
+        else:
+            portfolio_risk_value = min(portfolio_risk_value_ES,portfolio_risk_value_VaR)
+
+            #log
+            if portfolio_risk_value_ES<portfolio_risk_value_VaR:
+                print 'ES:',portfolio_ES_ratio
+            else:
+                print 'VaR:',portfolio_VaR_ratio
+        #
+        total_value = context.portfolio.portfolio_value
+        if portfolio_risk_value>total_value:
+            portfolio_alloc_ratio = 1.0
+        else:
+            portfolio_alloc_ratio = round((portfolio_risk_value/total_value),2)
+
+
+        return portfolio_alloc_ratio
+
 
     # Submain
     def get_stock_to_trade_df(self,context,stock_to_hold_list):
-        # 计算调仓信息
-        stock_to_trade_df = self.get_stock_trade_info(context,stock_to_hold_list)
+        # 按照风险计算各支股票的持仓比例
+        stock_alloc_ratio_df = self.cal_stock_alloc_ratio(context,stock_to_hold_list)
+
+        # 根据股票组合的整体风险，计算整理仓位比例
+        portfolio_alloc_ratio = self.cal_portfolio_alloc_ratio(context,stock_alloc_ratio_df)
+
+        print 'Portfolio Alloction Ratio',portfolio_alloc_ratio
+
+        # 根据各支股票的持仓比例，计算调仓信息
+        stock_to_trade_df = self.get_stock_trade_info(context,stock_alloc_ratio_df,portfolio_alloc_ratio)
 
         return stock_to_trade_df
 
